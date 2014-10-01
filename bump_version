@@ -1,0 +1,237 @@
+#!/bin/bash
+
+set -euo pipefail
+
+ORIG_LIB_DIR=".build/rabbitmq"
+ORIG_RMQ_DIR=".build/rabbitmq-server"
+ORIG_CODEGEN_DIR=".build/rabbitmq-codegen"
+
+# Clones the client when it is not present yet
+# Params: None
+function get_rmq_client {
+    echo "* Checking if rabbitmq source exists..."
+    if [ ! -d "${ORIG_LIB_DIR}" ]; then
+	echo "* It doesn't. Cloning..."
+	git clone https://github.com/rabbitmq/rabbitmq-erlang-client.git ${ORIG_LIB_DIR}
+    fi
+}
+
+# Gets the latest version of the RMQ client.
+# Params: None
+function update_rmq_client {
+    echo "* Updating client source..."
+    (cd ${ORIG_LIB_DIR} && git checkout master)
+    (cd ${ORIG_LIB_DIR} && git fetch origin)
+    (cd ${ORIG_LIB_DIR} && git pull origin master)
+}
+
+# Clones the rmq server sources when it is not present yet
+# Params: None
+function get_rmq_server {
+    echo "* Checking if rabbitmq server source exists..."
+    if [ ! -d "${ORIG_RMQ_DIR}" ]; then
+	echo "* It doesn't. Cloning..."
+	git clone https://github.com/rabbitmq/rabbitmq-server.git ${ORIG_RMQ_DIR}
+    fi
+}
+
+# Updates the rmq server sources to the latest version.
+# Params: None
+function update_rmq_server {
+    (cd ${ORIG_RMQ_DIR} && git checkout master)
+    (cd ${ORIG_RMQ_DIR} && git fetch origin)
+    (cd ${ORIG_RMQ_DIR} && git pull origin master)
+}
+
+# Clones the rmq code generation tools when they are not present yet.
+# Params: None
+function get_rmq_codegen {
+    echo "* Checking the rabbitmq codegen sources..."
+    if [ ! -d "${ORIG_CODEGEN_DIR}" ]; then
+	git clone https://github.com/rabbitmq/rabbitmq-codegen.git ${ORIG_CODEGEN_DIR}
+    fi
+}
+
+# Updates the code gen tools to the latest version
+# Params: None
+function update_rmq_codegen {
+    (cd ${ORIG_CODEGEN_DIR} && git checkout master)
+    (cd ${ORIG_CODEGEN_DIR} && git fetch origin)
+    (cd ${ORIG_CODEGEN_DIR} && git pull origin master)
+}
+
+# Checks out the specified tag
+# Params: The tag to check out
+function client_checkout_tag {
+    echo "Checking out client tag $1"
+    (cd $ORIG_LIB_DIR && git checkout $1)
+}
+
+# Checks out the specified tag
+# Params: The tag to check out
+function server_checkout_tag {
+    echo "Checking out server tag $1"
+    (cd $ORIG_RMQ_DIR && git checkout $1)
+}
+
+# Checks out the specified tag
+# Params: The tag to check out
+function codegen_checkout_tag {
+    echo "Checking out codegen tag $1"
+    (cd $ORIG_CODEGEN_DIR && git checkout $1)
+}
+
+# Builds the rmq server in order to get the generated files.
+# Params: None
+function build_rmq_server {
+    echo "* Building server files. (This can take a few minutes...)"
+    local failed=0
+    local log=""
+    log=$(make -C ${ORIG_RMQ_DIR} | tail -10) || failed=1
+    if [ ${failed} -eq 1 ]; then
+	echo "Build failed.. Last 10 lines of the log: "
+	echo "${log}"
+	exit 1
+    fi
+    echo "OK!"
+}
+
+# Cleans up the files from the target directories. This ensures that deprecated files are removed.
+# Params: None
+function remove_old_files {
+    echo "* Cleaning old files."
+    # Use -f as these files might not exist.
+    rm -f src/*.erl
+    rm -f include/*
+}
+
+# Reads the required modules from the app definition and copies those files
+# Params: None
+function copy_common_files {
+    echo "* Parsing dependencies."
+    local files=( $(tools/read_common_deps.escript "${ORIG_LIB_DIR}/rabbit_common.app.in") )
+    if [ ${#files[@]} -eq 0 ]; then
+	echo "No dependencies found."
+	exit 1
+    fi
+
+    echo "Got ${#files[@]} files."
+    for file in "${files[@]}"; do
+	echo "Copying ${file}"
+	cp "${ORIG_RMQ_DIR}/src/${file}" "src/${file}"
+    done
+}
+
+# Copies all files from the server include dir to the common include dir
+# Params: None
+function copy_include_files {
+    echo "Copying include files."
+    cp -r ${ORIG_RMQ_DIR}/include .
+}
+
+# Cleans up the rmq server build results in order to waste less diskspace
+# Params: None
+function cleanup {
+    echo "* Cleaning up..."
+    (make clean -C ${ORIG_RMQ_DIR} &> /dev/null )
+}
+
+# Updates the app.src file.
+# Params: The tag to use
+function update_app_src {
+    local latest_tag=$1
+    echo "* Updating app.src file."
+    sed "s/%%VERSION%%/${latest_tag}/g" src/rabbit_common.app.src.in > src/rabbit_common.app.src
+}
+
+# Shows the modified files before committing.
+# Params: None
+function review {
+    echo "* Please review the following changes:"
+    git add .
+    git status
+    echo "OK? (y/n)"
+    read -n 1 OK
+    printf "\n"
+    if [ "${OK}" != "y" ]; then
+	exit 1
+    fi
+}
+
+# Creates a commit
+# Params: None
+function commit {
+
+    git commit -m "NEW Bumped RabbitMQ version to ${latest_tag}"
+}
+
+# Creates a tag
+# Params: Current rabbitmq client version
+function tag {
+    local latest_tag=$1
+    git tag ${latest_tag}
+}
+# Pushes the changes to master.
+# Params: None
+function push {
+    git push origin master
+    git push origin --tags
+}
+
+# Determines whether to create a commit/tag or not.
+# Params: Latest rmq client tag
+function create_tag {
+    local latest_tag=$1
+    local current_tag=$(git describe --abbrev=0 --tags)
+    if [ ${current_tag}=${latest_tag} ]; then
+	echo "A commit with the current RMQ version already exists. Create new tag anyway?"
+	read -n 1 new_tag
+	printf "\n"
+	if [ "${new_tag}" != "y" ]; then
+            push
+	else
+	    commit
+	    git tag -f ${latest_tag}
+	    git push origin master
+	    git push origin --tags -f
+	fi
+    else
+	commit
+	tag ${latest_tag}
+	push
+    fi
+}
+
+function main {
+    get_rmq_client
+    update_rmq_client
+    get_rmq_server
+    update_rmq_server
+    get_rmq_codegen
+    update_rmq_codegen
+
+    # Determine the latest client tag
+    local latest_tag=$(cd ${ORIG_LIB_DIR} && git describe --abbrev=0 --tags)
+
+    # Checkout that tag
+    client_checkout_tag ${latest_tag}
+    server_checkout_tag ${latest_tag}
+    codegen_checkout_tag ${latest_tag}
+
+    # Build server files
+    build_rmq_server
+    remove_old_files
+
+    # Copy the common src and include files
+    copy_common_files
+    copy_include_files
+
+    cleanup
+
+    update_app_src ${latest_tag}
+
+    review
+    create_tag ${latest_tag}
+}
+
+main
